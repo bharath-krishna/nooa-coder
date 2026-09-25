@@ -1,0 +1,52 @@
+# nooa LLM registry — user-global layer.
+#
+# Discovery order (lowest priority first), per nooa.llm_config.llm_config_chain:
+#   1. bundled defaults from packages registering `nooa.bundled_configs`
+#   2. THIS FILE            ~/.config/nooa/llm_config.yaml
+#   3. project-local        <project-root>/.nooa/llm_config.yaml
+#   4. NEMO_OO_LLM_CONFIG   comma-separated paths (always wins)
+#
+# Later layers override earlier ones. Set an alias to `null` in a later layer
+# to remove it. Inspect the resolved result with `nooa config show`.
+#
+# Schema per alias:
+#   model_name      exact litellm routing string (required)
+#   api_base        endpoint URL
+#   api_key_env     name of the env var holding the key
+#   context_window  optional; needed for custom models litellm has no metadata for
+#   temperature / top_p / max_tokens / drop_params   optional
+
+models:
+  # ---------------------------------------------------------------- Custom vLLM endpoint
+  nemotron-3.5-lightning-bf16:
+    model_name: openai/nemotron-3.5-lightning-bf16
+    api_base: https://nemo35-lightning.krishb.in/v1
+    context_window: 131072 # = vLLM max_model_len; litellm has no metadata
+    drop_params: true
+
+  # Deterministic variant for subagents and review passes.
+  nemotron-3.5-lightning-cheap:
+    model_name: openai/nemotron-3.5-lightning-bf16
+    api_base: https://nemo35-lightning.krishb.in/v1
+    context_window: 1048576
+    temperature: 0.0
+    drop_params: true
+
+  # OpenAI models (require OPENAI_API_KEY env var)
+  gpt-mini:
+    model_name: openai/gpt-5-mini
+    api_key_env: OPENAI_API_KEY
+
+  gpt-nano:
+    model_name: openai/gpt-5-nano
+    api_key_env: OPENAI_API_KEY
+
+  gpt-big:
+    model_name: openai/gpt-5
+    api_key_env: OPENAI_API_KEY
+
+  # Cheap, deterministic workhorse for subagents and review passes.
+  gpt-cheap:
+    model_name: openai/gpt-5-mini
+    api_key_env: OPENAI_API_KEY
+    temperature: 0.0

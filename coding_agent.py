@@ -22,17 +22,45 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Annotated
 
-import litellm
-
-from nooa import Agent, TextSkill, hidden, strategy
+from nooa import Agent, TextSkill, hidden
 from nooa.tools import ShellTools
-from nooa.strategies import CodeActStrategy, PredictStrategy
-from nooa.config import CodeActConfig, PredictConfig
 from nooa.unifiedllm import get_llm_client
 
+from pydantic import BaseModel, Field
+
 from pyright_lsp import PyrightLSP
+
+# ---------------------------------------------------------------------------
+# Structured outputs for the build loop (module level so CodeAct can see them)
+# ---------------------------------------------------------------------------
+
+
+class Plan(BaseModel):
+    """What "done" means for a request, and the first batch of work."""
+
+    goal: str = Field(description="The user's expectation restated in one or two sentences")
+    acceptance_criteria: list[str] = Field(
+        description="Concrete, checkable conditions that must all hold before the work is done"
+    )
+    tasks: list[str] = Field(
+        description="Ordered, self-contained implementation steps, each small enough "
+        "for one develop() call. Include writing tests for new behaviour."
+    )
+    test_command: str = Field(
+        description="Shell command, run from the project root, that runs the test suite "
+        "(e.g. 'uv run pytest -q')"
+    )
+
+
+class Review(BaseModel):
+    """Verdict on the work so far against the plan's acceptance criteria."""
+
+    done: bool = Field(description="True only if every acceptance criterion is met")
+    unmet: list[str] = Field(description="Acceptance criteria that are not yet met")
+    next_tasks: list[str] = Field(description="Tasks that would close the gaps; empty when done")
+    summary: str = Field(description="What was built and how to use it, for the user")
+
 
 # ---------------------------------------------------------------------------
 # LLM client – resolved via nooa registry (llm_config.yaml)
@@ -409,17 +437,109 @@ class CodingAgent(Agent, llm=llm):
         """
         ...
 
+    async def plan(self, req: str) -> Plan:
+        """Turn the user's request into acceptance criteria and a task list.
+
+        Explore the project first (layout, existing code, how tests are run) so
+        the tasks fit what is already there. Criteria must be verifiable by
+        running code or tests, not matters of taste. Include tasks that add
+        tests for every new behaviour, and pick a ``test_command`` that works in
+        this project (add pytest as a dev dependency in a task if it is missing).
+        """
+        ...
+
+    async def fix(self, report: str) -> str:
+        """Make the type check and test suite in ``report`` pass.
+
+        Read the failing code before changing it, fix the root cause rather than
+        the symptom, and never delete or weaken a test just to make it pass.
+        Run ``lsp.diagnostics(path)`` on every file you touch. Return what you
+        changed and why.
+        """
+        ...
+
+    async def review(self, req: str, plan: Plan, verification: str, log: list[str]) -> Review:
+        """Judge whether the user's request is fully delivered.
+
+        ``verification`` is the latest type-check and test output; ``log`` is
+        what each step reported. Check each acceptance criterion against the
+        actual code and tests (read them — do not trust the log alone). If
+        something is missing, incomplete or untested, set ``done=False`` and
+        list the follow-up tasks.
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Orchestration – plain Python, so the LLM cannot skip the gates.
+    # ------------------------------------------------------------------
+
+    async def _verify(self, test_command: str) -> tuple[bool, str]:
+        """Type-check the project and run the tests; return (passed, report)."""
+        diags = await self.lsp.diagnostics()
+        type_ok = not any("  error: " in line for line in diags.splitlines())
+        tests = await self.bash.shell.run(test_command, timeout=600)
+        # pytest exits 5 when it collects nothing; untested work does not count as passing.
+        tests_ok = tests.returncode == 0
+        report = (
+            f"$ basedpyright\n{diags}\n\n"
+            f"$ {test_command}  (exit {tests.returncode})\n{tests.stdout}\n{tests.stderr}"
+        )
+        return type_ok and tests_ok, report.strip()
+
+    @hidden
+    async def build(self, req: str, max_rounds: int = 5, max_fix_attempts: int = 3) -> str:
+        """Plan, implement, verify and fix until the request is done or the budget runs out."""
+        plan = await self.plan(req)
+        print(f"[plan] {plan.goal}")
+        for criterion in plan.acceptance_criteria:
+            print(f"  - {criterion}")
+
+        queue = list(plan.tasks)
+        log: list[str] = []
+        report = ""
+        verdict = Review(done=False, unmet=plan.acceptance_criteria, next_tasks=[], summary="")
+        for round_no in range(1, max_rounds + 1):
+            for task in queue:
+                print(f"[round {round_no}] {task}")
+                result = await self.develop(f"{task}\n\nOverall goal: {plan.goal}")
+                log.append(f"{task}\n-> {result[:2000]}")
+
+            passed = False
+            for attempt in range(1, max_fix_attempts + 1):
+                passed, report = await self._verify(plan.test_command)
+                if passed:
+                    break
+                print(f"[verify] failing, fix attempt {attempt}/{max_fix_attempts}")
+                log.append(f"fix -> {(await self.fix(report))[:2000]}")
+            print(f"[verify] {'passing' if passed else 'still failing'}")
+
+            verdict = await self.review(req, plan, report, log)
+            if passed and verdict.done:
+                return verdict.summary
+            queue = verdict.next_tasks or ["Make the type check and test suite pass."]
+            print(f"[review] not done: {'; '.join(verdict.unmet) or 'checks failing'}")
+
+        return (
+            f"Stopped after {max_rounds} rounds without meeting every criterion.\n\n"
+            f"Last review: {verdict.summary}\nUnmet: {verdict.unmet}\n\n{report}"
+        )
+
 
 async def main():
-    """Run the agent as an interactive REPL until the user types ``exit``."""
+    """Take a request, build it to completion, then ask the user for the next one."""
 
     agent = CodingAgent()
-    while True:
-        user_input = input("User: ")
-        if user_input == "exit":
-            break
-        print(f"Agent: {await agent.develop(user_input)}")
-    await agent.lsp.close()
+    prompt = "What should I build? "
+    try:
+        while True:
+            # input() blocks; keep the event loop (and the LSP reader) running.
+            req = (await asyncio.to_thread(input, prompt)).strip()
+            if req in ("", "exit"):
+                break
+            print(f"Agent: {await agent.build(req)}")
+            prompt = "\nAnything else? (exit to quit) "
+    finally:
+        await agent.lsp.close()
 
 
 if __name__ == "__main__":

@@ -13,12 +13,15 @@ import asyncio
 import json
 import os
 import shutil
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Annotated, Any
 
 from nooa import Skill
 from nooa.agentdoc import hidden
+
+# Decoded LSP / JSON-RPC message payloads.
+JsonDict = dict[str, Any]
 
 _SEVERITY = {1: "error", 2: "warning", 3: "info", 4: "hint"}
 
@@ -49,9 +52,9 @@ class _LspTransport:
         self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
         self._next_id = 0
-        self._pending: dict[int, asyncio.Future] = {}
-        self._reader_task: asyncio.Task | None = None
-        self.on_notification = lambda method, params: None
+        self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._reader_task: asyncio.Task[None] | None = None
+        self.on_notification: Callable[[str, JsonDict], None] = lambda _method, _params: None
 
     async def start(self) -> None:
         self._proc = await asyncio.create_subprocess_exec(
@@ -95,7 +98,7 @@ class _LspTransport:
                     fut.set_exception(ConnectionResetError("language server exited"))
             self._pending.clear()
 
-    def _dispatch(self, msg: dict) -> None:
+    def _dispatch(self, msg: JsonDict) -> None:
         if "id" in msg and ("result" in msg or "error" in msg):
             fut = self._pending.pop(msg["id"], None)
             if fut and not fut.done():
@@ -109,7 +112,7 @@ class _LspTransport:
                 self._send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
             self.on_notification(msg["method"], msg.get("params") or {})
 
-    def _send(self, payload: dict) -> None:
+    def _send(self, payload: JsonDict) -> None:
         if not self._proc or not self._proc.stdin:
             raise ConnectionResetError("language server is not running")
         raw = json.dumps(payload).encode()
@@ -121,7 +124,7 @@ class _LspTransport:
     async def request(self, method: str, params: Any = None, timeout: float = 60.0) -> Any:
         self._next_id += 1
         req_id = self._next_id
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
         self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
         try:
@@ -221,9 +224,9 @@ class PyrightLSP(Skill):
         self._transport: Annotated[_LspTransport | None, hidden] = None
         self._lock: Annotated[asyncio.Lock, hidden] = asyncio.Lock()
         self._open: Annotated[dict[str, tuple[int, str]], hidden] = {}
-        self._diags: Annotated[dict[str, list], hidden] = {}
+        self._diags: Annotated[dict[str, list[JsonDict]], hidden] = {}
         self._diag_event: Annotated[asyncio.Event, hidden] = asyncio.Event()
-        self._busy: Annotated[set, hidden] = set()
+        self._busy: Annotated[set[str], hidden] = set()
         self._encoding: Annotated[str, hidden] = "utf-16"
 
     def __repr__(self) -> str:  # keeps memory addresses out of rendered prompts
@@ -282,7 +285,7 @@ class PyrightLSP(Skill):
         self._open.clear()
         return transport
 
-    def _on_notification(self, method: str, params: dict) -> None:
+    def _on_notification(self, method: str, params: JsonDict) -> None:
         if method == "textDocument/publishDiagnostics":
             self._diags[params["uri"]] = params.get("diagnostics", [])
             self._diag_event.set()
@@ -311,6 +314,10 @@ class PyrightLSP(Skill):
         await self.close()
         await self._ensure_started()
         return "pyright language server restarted"
+
+    async def _request(self, method: str, params: JsonDict, timeout: float = 60.0) -> Any:
+        transport = await self._ensure_started()
+        return await transport.request(method, params, timeout)
 
     # -- document sync -----------------------------------------------------
 
@@ -347,7 +354,7 @@ class PyrightLSP(Skill):
             self._diag_event.clear()
         return uri, text.splitlines()
 
-    async def _wait_for_diagnostics(self, uri: str) -> list:
+    async def _wait_for_diagnostics(self, uri: str) -> list[JsonDict]:
         """Wait until pyright stops republishing for ``uri`` (or we time out)."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._settle_timeout
@@ -365,7 +372,7 @@ class PyrightLSP(Skill):
 
     # -- position helpers --------------------------------------------------
 
-    def _to_lsp_pos(self, lines: list[str], line: int, column: int | None, symbol: str | None) -> dict:
+    def _to_lsp_pos(self, lines: list[str], line: int, column: int | None, symbol: str | None) -> dict[str, int]:
         idx = max(0, line - 1)
         src = lines[idx] if idx < len(lines) else ""
         if column is None:
@@ -381,7 +388,7 @@ class PyrightLSP(Skill):
             col0 = len(src[:col0].encode("utf-16-le")) // 2
         return {"line": idx, "character": col0}
 
-    def _from_lsp_pos(self, pos: dict, lines: list[str] | None = None) -> tuple[int, int]:
+    def _from_lsp_pos(self, pos: dict[str, int], lines: list[str] | None = None) -> tuple[int, int]:
         line0, char = pos["line"], pos["character"]
         if self._encoding == "utf-16" and lines is not None and line0 < len(lines):
             char = len(lines[line0].encode("utf-16-le")[: char * 2].decode("utf-16-le", "ignore"))
@@ -394,7 +401,7 @@ class PyrightLSP(Skill):
         except ValueError:
             return str(p)
 
-    def _loc_line(self, uri: str, rng: dict) -> str:
+    def _loc_line(self, uri: str, rng: JsonDict) -> str:
         path = self._rel(uri)
         try:
             lines = self._resolve(path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -477,14 +484,14 @@ class PyrightLSP(Skill):
         """
         async with self._lock:
             uri, lines = await self._sync(path)
-            result = await self._transport.request(  # type: ignore[union-attr]
+            result = await self._request(
                 "textDocument/documentSymbol", {"textDocument": {"uri": uri}}
             )
         if not result:
             return f"{self._rel(uri)}: no symbols found"
         out: list[str] = []
 
-        def walk(nodes: list, depth: int) -> None:
+        def walk(nodes: list[JsonDict], depth: int) -> None:
             for node in nodes:
                 rng = node.get("selectionRange") or node.get("range") or node["location"]["range"]
                 line, _ = self._from_lsp_pos(rng["start"], lines)
@@ -527,7 +534,7 @@ class PyrightLSP(Skill):
         async with self._lock:
             uri, lines = await self._sync(path)
             pos = self._to_lsp_pos(lines, line, column, symbol)
-            result = await self._transport.request(  # type: ignore[union-attr]
+            result = await self._request(
                 "textDocument/hover", {"textDocument": {"uri": uri}, "position": pos}
             )
         contents = (result or {}).get("contents")
@@ -551,7 +558,7 @@ class PyrightLSP(Skill):
         async with self._lock:
             uri, lines = await self._sync(path)
             pos = self._to_lsp_pos(lines, line, column, symbol)
-            result = await self._transport.request(  # type: ignore[union-attr]
+            result = await self._request(
                 "textDocument/definition", {"textDocument": {"uri": uri}, "position": pos}
             )
         return self._format_locations(result, "no definition found")
@@ -577,7 +584,7 @@ class PyrightLSP(Skill):
         async with self._lock:
             uri, lines = await self._sync(path)
             pos = self._to_lsp_pos(lines, line, column, symbol)
-            result = await self._transport.request(  # type: ignore[union-attr]
+            result = await self._request(
                 "textDocument/references",
                 {
                     "textDocument": {"uri": uri},
@@ -606,7 +613,7 @@ class PyrightLSP(Skill):
         async with self._lock:
             uri, lines = await self._sync(path)
             pos = self._to_lsp_pos(lines, line, column, symbol)
-            result = await self._transport.request(  # type: ignore[union-attr]
+            result = await self._request(
                 "textDocument/rename",
                 {"textDocument": {"uri": uri}, "position": pos, "newName": new_name},
                 timeout=120.0,
